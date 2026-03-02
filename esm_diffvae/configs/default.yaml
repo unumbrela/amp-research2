@@ -1,0 +1,103 @@
+# ESM-DiffVAE v5 Configuration
+
+# ESM-2 Feature Extractor
+esm:
+  model_name: "esm2_t6_8M_UR50D"
+  embedding_dim: 320
+
+# VAE Architecture (v5: GRU encoder + autoregressive GRU decoder with z-injection)
+vae:
+  aa_vocab_size: 21
+  max_seq_len: 50
+  hidden_dim: 256             # encoder GRU hidden per direction
+  latent_dim: 64              # 128 → 64: smaller latent for 6.6K dataset
+  n_encoder_layers: 1         # single bidirectional GRU layer
+  n_decoder_layers: 2         # decoder GRU layers
+  decoder_hidden_dim: 384     # decoder GRU hidden dim
+  decoder_embedding_dim: 64   # token embedding dim for decoder input
+  dropout: 0.2                # 0.3 → 0.2: less dropout with word_dropout active
+  word_dropout: 0.25          # NEW: randomly replace 25% of decoder inputs with BOS
+
+# Property Conditioning
+properties:
+  dim: 5
+  names: ["is_amp", "mic_value", "is_toxic", "is_hemolytic", "length_norm"]
+
+# Latent Diffusion
+diffusion:
+  T: 50
+  schedule: "cosine"
+  beta_start: 0.0001
+  beta_end: 0.02
+  denoiser_hidden_dim: 256
+  guidance_scale: 1.2
+  cfg_drop_prob: 0.1
+
+# VAE Training
+train_vae:
+  epochs: 400                   # 300 → 400: more training with cyclical KL
+  batch_size: 64
+  lr: 3.0e-4                    # 5e-4 → 3e-4: slightly lower for stability
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  beta_max: 0.25                # 0.5 → 0.25: less KL pressure, better reconstruction
+  beta_warmup_epochs: 200       # 30 → 200: total annealing epochs (across cycles)
+  kl_n_cycles: 4                # NEW: 4 cyclical annealing cycles
+  kl_ratio_ramp: 0.5            # NEW: 50% ramp, 50% hold per cycle
+  free_bits: 0.05               # NEW: minimum 0.05 nats per latent dim
+  lambda_contrastive: 0.2       # 0.3 → 0.2: reduce auxiliary loss weight
+  lambda_property: 0.2          # 0.3 → 0.2: reduce auxiliary loss weight
+  lambda_length: 0.2
+  early_stopping_patience: 80   # 25 → 40: allow cyclical KL to recover
+  label_smoothing: 0.05         # 0.1 → 0.05: less smoothing for sharper predictions
+  one_hot_dropout_prob: 0.1     # 0.15 → 0.1: word_dropout handles regularization
+  esm_noise_std: 0.03           # 0.05 → 0.03: less noise
+  ema_decay: 0.999
+  fp16: true
+  # Teacher forcing schedule (v5)
+  teacher_forcing_start: 1.0    # initial ratio (full teacher forcing)
+  teacher_forcing_end: 0.6      # 0.5 → 0.6: keep more teacher forcing
+  teacher_forcing_warmup: 150   # 100 → 150: slower decay
+
+# Diffusion Training
+train_diffusion:
+  epochs: 500
+  batch_size: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  validation:
+    enabled: true
+    early_stop_patience: 30
+
+# Generation
+generation:
+  default_variation_strength: 0.1
+  n_samples: 100
+  temperature: 1.1
+  top_k: 20
+  top_p: 0.95
+  filtering:
+    min_identity: 0.65
+    max_identity: 0.9
+    min_edit_distance: 3
+    max_edit_distance: 8
+    min_len: 8
+    max_len: 40
+    unique_only: true
+    max_attempts_multiplier: 10
+
+# Data
+data:
+  min_len: 5
+  max_len: 50
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  random_seed: 42
+
+# Paths
+paths:
+  data_dir: "data"
+  checkpoint_dir: "checkpoints"
+  results_dir: "results"

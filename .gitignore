@@ -107,3 +107,19 @@ temp/
 
 # Webdev artifacts (checkpoint zips, migrations, etc.)
 .webdev/
+
+# ESM-DiffVAE
+references/
+esm_diffvae/data/raw/
+esm_diffvae/data/processed/
+esm_diffvae/data/embeddings/
+esm_diffvae/checkpoints/
+esm_diffvae/results/
+esm_diffvae/.pytest_cache/
+__pycache__/
+*.pyc
+*.pt
+*.pth
+
+# Local notes / scratch
+/日志

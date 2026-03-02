@@ -29,17 +29,20 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
 
       - name: Install deps
+        working-directory: frontend
         run: pnpm install --frozen-lockfile
 
       - name: Build static site for Pages
+        working-directory: frontend
         run: pnpm exec vite build --base="/${{ github.event.repository.name }}/"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dist/public
+          path: frontend/dist/public
 
   deploy:
     environment:

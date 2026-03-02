@@ -1,0 +1,11 @@
+torch>=2.0
+fair-esm>=2.0.0
+modlamp>=4.3
+scikit-learn>=1.2
+pandas>=2.0
+biopython>=1.80
+pyyaml>=6.0
+matplotlib>=3.7
+seaborn>=0.12
+tqdm>=4.65
+numpy>=1.24
