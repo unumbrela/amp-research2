@@ -7,6 +7,7 @@ discriminator and REINFORCE policy gradient.
 
 import argparse
 import csv
+from datetime import datetime
 import math
 import sys
 from pathlib import Path
@@ -23,7 +24,7 @@ from models.discriminator import SequenceDiscriminator
 from models.plm_extractor import BACKEND_REGISTRY
 from training.dataset import create_dataloader
 from training.losses import reconstruction_loss
-from training.utils import save_checkpoint, load_checkpoint, TrainingLogger
+from training.utils import save_checkpoint, load_checkpoint, TrainingLogger, RunLogger
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -253,6 +254,14 @@ def main():
 
     # Logger
     logger = TrainingLogger(ckpt_dir / "vae_rl_training_log.jsonl", append=False)
+    run_name = f"vae_rl_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+    run_logger.info(
+        f"run_start device={device} backend={backend} model={model_name} "
+        f"epochs={rl_cfg['epochs']} batch_size={config['train_vae']['batch_size']} "
+        f"gen_lr={rl_cfg['lr']} disc_lr={rl_cfg['disc_lr']}"
+    )
 
     running_reward = 0.5  # initial baseline
     disc_steps = rl_cfg["disc_steps_per_gen_step"]
@@ -295,6 +304,7 @@ def main():
         avg_metrics = {k: v / n_batches for k, v in epoch_metrics.items()}
         avg_metrics["running_reward"] = running_reward
         logger.log(epoch, avg_metrics, "train_rl")
+        run_logger.log_metrics(epoch, avg_metrics, "train")
 
         print(
             f"RL Epoch {epoch:3d} | "
@@ -312,14 +322,29 @@ def main():
                 model, gen_optimizer, epoch, avg_metrics["gen_total_loss"],
                 ckpt_dir / f"vae_rl_epoch_{epoch}.pt",
             )
+            run_logger.info(
+                f"periodic_checkpoint epoch={epoch} gen_total_loss={avg_metrics['gen_total_loss']:.6f} "
+                f"checkpoint=vae_rl_epoch_{epoch}.pt"
+            )
 
     # Save final model
+    final_gen_loss = float(avg_metrics.get("gen_total_loss", 0)) if 'avg_metrics' in locals() else 0.0
     save_checkpoint(
         model, gen_optimizer, rl_cfg["epochs"] - 1,
-        avg_metrics.get("gen_total_loss", 0),
+        final_gen_loss,
         ckpt_dir / "vae_rl_final.pt",
     )
+    run_logger.write_result({
+        "run_name": run_name,
+        "status": "completed",
+        "epochs_configured": int(rl_cfg["epochs"]),
+        "final_gen_total_loss": float(final_gen_loss),
+        "final_checkpoint": str((ckpt_dir / "vae_rl_final.pt").resolve()),
+    })
+    run_logger.info("run_complete")
     print(f"\nRL fine-tuning complete. Model saved to {ckpt_dir}/vae_rl_final.pt")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ Mutation modes:
 """
 
 import argparse
+from datetime import datetime
 import json
 import math
 import random
@@ -28,7 +29,7 @@ from training.dataset import (
     AA_TO_IDX, AA_VOCAB, PAD_IDX,
     indices_to_sequence, sequence_to_indices,
 )
-from training.utils import load_checkpoint
+from training.utils import load_checkpoint, RunLogger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -639,9 +640,16 @@ def main():
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    ckpt_dir = PROJECT_ROOT / config["paths"]["checkpoint_dir"]
+    run_name = f"generate_variant_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+
     gen_cfg = config.get("generation", {})
     var_cfg = _get_variant_cfg(config)
     mode = args.mode or var_cfg.get("mode", "mixed")
+    selected_mode = mode
     n_variants = int(args.n_variants if args.n_variants is not None else var_cfg.get("n_variants", 50))
     global_temp = float(args.temperature if args.temperature is not None else var_cfg.get("temperature", gen_cfg.get("temperature", 0.8)))
     global_top_k = int(args.top_k if args.top_k is not None else var_cfg.get("top_k", gen_cfg.get("top_k", 10)))
@@ -651,6 +659,10 @@ def main():
     model = ESMDiffVAE(config).to(device)
     load_checkpoint(model, args.checkpoint, device=args.device)
     model.eval()
+    run_logger.info(
+        f"run_start device={device} checkpoint={Path(args.checkpoint).resolve()} config={Path(args.config).resolve()} "
+        f"mode={mode} n_variants={n_variants}"
+    )
 
     input_seq = args.input_sequence.upper().strip()
     print(f"Input sequence: {input_seq} (len={len(input_seq)})")
@@ -757,10 +769,10 @@ def main():
             m = v.get("mode", "unknown")
             modes.setdefault(m, []).append(v)
         print(f"\nSummary by mode:")
-        for mode, vlist in sorted(modes.items()):
+        for mode_name, vlist in sorted(modes.items()):
             ids = [v["identity"] for v in vlist]
             eds = [v["edit_distance"] for v in vlist]
-            print(f"  {mode:<12}: {len(vlist):3d} variants, "
+            print(f"  {mode_name:<12}: {len(vlist):3d} variants, "
                   f"identity={sum(ids)/len(ids):.1%} [{min(ids):.1%}-{max(ids):.1%}], "
                   f"edit_dist={sum(eds)/len(eds):.1f} [{min(eds)}-{max(eds)}]")
 
@@ -791,11 +803,24 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump({
             "input_sequence": input_seq,
-            "mode": mode,
+            "mode": selected_mode,
             "n_generated": len(variants),
             "variants": variants,
         }, f, indent=2)
     print(f"Saved metrics to {metrics_path}")
+    run_logger.write_result({
+        "run_name": run_name,
+        "status": "completed",
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "mode": selected_mode,
+        "input_sequence": input_seq,
+        "n_generated": int(len(variants)),
+        "output_fasta": str(output_path.resolve()),
+        "output_metrics_json": str(metrics_path.resolve()),
+    })
+    run_logger.info("run_complete")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

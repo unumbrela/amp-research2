@@ -6,6 +6,7 @@ then trains the diffusion denoising network on these latent representations.
 
 import argparse
 import csv
+from datetime import datetime
 import sys
 from pathlib import Path
 
@@ -17,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
 from models.plm_extractor import BACKEND_REGISTRY
 from training.dataset import create_dataloader
-from training.utils import save_checkpoint, load_checkpoint, TrainingLogger, EarlyStopping
+from training.utils import save_checkpoint, load_checkpoint, TrainingLogger, RunLogger, EarlyStopping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -278,6 +279,14 @@ def main():
     # Training
     ckpt_dir = PROJECT_ROOT / config["paths"]["checkpoint_dir"]
     logger = TrainingLogger(ckpt_dir / "diffusion_training_log.jsonl", append=args.append_log)
+    run_name = f"diffusion_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+    run_logger.info(
+        f"run_start device={device} backend={backend} model={model_name} "
+        f"epochs={config['train_diffusion']['epochs']} batch_size={config['train_diffusion']['batch_size']} "
+        f"lr={config['train_diffusion']['lr']} val_enabled={val_enabled}"
+    )
     best_loss = float("inf")
     patience = (
         args.early_stop_patience
@@ -290,10 +299,12 @@ def main():
     for epoch in range(config["train_diffusion"]["epochs"]):
         train_loss = run_epoch(model, latent_loader, optimizer, device, grad_clip, train=True)
         logger.log(epoch, {"loss": train_loss}, "train")
+        run_logger.log_metrics(epoch, {"loss": train_loss}, "train")
         val_loss = None
         if val_enabled and val_loader is not None:
             val_loss = run_epoch(model, val_loader, optimizer, device, grad_clip, train=False)
             logger.log(epoch, {"loss": val_loss}, "val")
+            run_logger.log_metrics(epoch, {"loss": val_loss}, "val")
 
         if epoch % 10 == 0:
             if val_loss is None:
@@ -306,21 +317,36 @@ def main():
             best_loss = score
             save_checkpoint(model, optimizer, epoch, score,
                           ckpt_dir / "diffusion_best.pt")
+            run_logger.info(f"best_score epoch={epoch} value={best_loss:.6f} checkpoint=diffusion_best.pt")
 
         if (epoch + 1) % 50 == 0:
             save_checkpoint(model, optimizer, epoch, score,
                           ckpt_dir / f"diffusion_epoch_{epoch}.pt")
+            run_logger.info(f"periodic_checkpoint epoch={epoch} score={score:.6f}")
 
         if early_stopping is not None and val_loss is not None and early_stopping.step(val_loss):
             print(f"Early stopping diffusion at epoch {epoch} (best val loss={best_loss:.6f})")
+            run_logger.info(f"early_stopping epoch={epoch} best={best_loss:.6f}")
             break
 
     # Save final full model
     final_score = val_loss if val_loss is not None else train_loss
     save_checkpoint(model, optimizer, epoch, final_score,
                   ckpt_dir / "esm_diffvae_full.pt")
+    result_summary = {
+        "run_name": run_name,
+        "status": "completed",
+        "best_loss": float(best_loss),
+        "final_score": float(final_score),
+        "best_checkpoint": str((ckpt_dir / "diffusion_best.pt").resolve()),
+        "full_model_checkpoint": str((ckpt_dir / "esm_diffvae_full.pt").resolve()),
+    }
+    run_logger.write_result(result_summary)
+    run_logger.info("run_complete")
     print(f"\nDiffusion training complete. Best loss: {best_loss:.6f}")
     print(f"Full model saved to {ckpt_dir}/esm_diffvae_full.pt")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

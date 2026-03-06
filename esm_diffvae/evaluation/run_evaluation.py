@@ -5,6 +5,7 @@ computes all metrics, generates plots, and saves results.
 """
 
 import argparse
+from datetime import datetime
 import json
 import sys
 from pathlib import Path
@@ -15,7 +16,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
-from training.utils import load_checkpoint
+from training.utils import load_checkpoint, RunLogger
 from generation.unconditional import generate_unconditional, resolve_unconditional_params
 from generation.variant import generate_variants
 from evaluation.metrics import (
@@ -167,6 +168,14 @@ def main():
     print(f"=== ESM-DiffVAE Full Evaluation ===")
     print(f"Device: {device}")
 
+    ckpt_dir = PROJECT_ROOT / config["paths"]["checkpoint_dir"]
+    run_name = f"evaluation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+    run_logger.info(
+        f"run_start device={device} checkpoint={Path(args.checkpoint).resolve()} config={Path(args.config).resolve()}"
+    )
+
     # Load model
     model = ESMDiffVAE(config).to(device)
     load_checkpoint(model, args.checkpoint, device=args.device)
@@ -214,8 +223,25 @@ def main():
     with open(results_dir / "evaluation_results.json", "w") as f:
         json.dump(all_results, f, indent=2, default=convert)
 
+    run_logger.write_result({
+        "run_name": run_name,
+        "status": "completed",
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "results_dir": str(results_dir.resolve()),
+        "outputs": {
+            "evaluation_results_json": str((results_dir / "evaluation_results.json").resolve()),
+            "unconditional_fasta": str((results_dir / "unconditional_sequences.fasta").resolve()),
+        },
+        "summary": {
+            "unconditional": uncond_results.get("metrics", {}),
+            "n_variant_tasks": int(len(variant_results)),
+        },
+    })
+    run_logger.info("run_complete")
     print(f"\n=== Evaluation Complete ===")
     print(f"Results saved to {results_dir}/")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

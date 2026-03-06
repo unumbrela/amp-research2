@@ -481,11 +481,6 @@ def main():
             run_logger.info(f"early_stopping epoch={epoch} patience={config['train_vae']['early_stopping_patience']}")
             break
 
-    print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
-    print(f"Checkpoints saved to {ckpt_dir}/")
-    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
-    print(f"Run summary: {(run_logger.run_dir / "result_summary.json").resolve()}")
-
     result_summary = {
         "run_name": run_name,
         "epochs_configured": int(config["train_vae"]["epochs"]),
@@ -502,6 +497,10 @@ def main():
     }
     run_logger.write_result(result_summary)
     run_logger.info("run_complete")
+    print(f"\nTraining complete. Best val loss: {best_val_loss:.4f}")
+    print(f"Checkpoints saved to {ckpt_dir}/")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

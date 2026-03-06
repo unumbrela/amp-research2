@@ -1,6 +1,7 @@
 """Unconditional AMP generation: generate novel sequences from scratch."""
 
 import argparse
+from datetime import datetime
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
 from training.dataset import indices_to_sequence
-from training.utils import load_checkpoint
+from training.utils import load_checkpoint, RunLogger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -157,10 +158,18 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    ckpt_dir = PROJECT_ROOT / config["paths"]["checkpoint_dir"]
+    run_name = f"generate_unconditional_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+
     device = torch.device(args.device)
     model = ESMDiffVAE(config).to(device)
     load_checkpoint(model, args.checkpoint, device=args.device)
     print(f"Loaded model from {args.checkpoint}")
+    run_logger.info(
+        f"run_start device={device} checkpoint={Path(args.checkpoint).resolve()} config={Path(args.config).resolve()}"
+    )
 
     gen_params = resolve_unconditional_params(
         config,
@@ -200,6 +209,17 @@ def main():
             f.write(f">generated_{i+1} len={len(seq)}\n{seq}\n")
 
     print(f"Saved to {output_path}")
+    run_logger.write_result({
+        "run_name": run_name,
+        "status": "completed",
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "n_requested": int(gen_params["n_samples"]),
+        "n_generated": int(len(sequences)),
+        "output_fasta": str(output_path.resolve()),
+    })
+    run_logger.info("run_complete")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

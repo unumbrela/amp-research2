@@ -1,6 +1,7 @@
 """Latent space interpolation between two AMP sequences."""
 
 import argparse
+from datetime import datetime
 import sys
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
 from training.dataset import indices_to_sequence, sequence_to_indices
-from training.utils import load_checkpoint
+from training.utils import load_checkpoint, RunLogger
 from generation.variant import sequence_identity
 
 
@@ -103,9 +104,18 @@ def main():
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
+    ckpt_dir = PROJECT_ROOT / config["paths"]["checkpoint_dir"]
+    run_name = f"generate_interpolation_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_logger = RunLogger(ckpt_dir / "logs" / run_name, append=False)
+    print(f"Run logs will be saved to: {run_logger.run_dir.resolve()}")
+
     device = torch.device(args.device)
     model = ESMDiffVAE(config).to(device)
     load_checkpoint(model, args.checkpoint, device=args.device)
+    run_logger.info(
+        f"run_start device={device} checkpoint={Path(args.checkpoint).resolve()} config={Path(args.config).resolve()} "
+        f"n_steps={args.n_steps}"
+    )
 
     print(f"Seq A: {args.seq_a}")
     print(f"Seq B: {args.seq_b}")
@@ -119,6 +129,7 @@ def main():
         seq_display = r['sequence'][:37] + "..." if len(r['sequence']) > 40 else r['sequence']
         print(f"{r['alpha']:6.2f} {seq_display:<40} {r['length']:4d} {r['identity_a']:5.1%} {r['identity_b']:5.1%}")
 
+    output_path = None
     if args.output:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -127,6 +138,20 @@ def main():
                 f.write(f">interp_alpha={r['alpha']:.2f} id_a={r['identity_a']:.3f} id_b={r['identity_b']:.3f}\n")
                 f.write(f"{r['sequence']}\n")
         print(f"\nSaved to {output_path}")
+
+    run_logger.write_result({
+        "run_name": run_name,
+        "status": "completed",
+        "checkpoint": str(Path(args.checkpoint).resolve()),
+        "seq_a": args.seq_a,
+        "seq_b": args.seq_b,
+        "n_steps": int(args.n_steps),
+        "n_results": int(len(results)),
+        "output_path": str(output_path.resolve()) if output_path else None,
+    })
+    run_logger.info("run_complete")
+    print(f"Run logs saved to: {run_logger.run_dir.resolve()}")
+    print(f"Run summary: {(run_logger.run_dir / 'result_summary.json').resolve()}")
 
 
 if __name__ == "__main__":

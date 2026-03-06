@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { motion, useInView } from "framer-motion";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import PointCloudHero from "@/components/PointCloudHero";
 import {
   ResponsiveContainer,
   BarChart,
@@ -269,7 +270,17 @@ const references = [
   },
 ];
 
-function Section({ children, id, className = "" }: { children: ReactNode; id: string; className?: string }) {
+function Section({
+  children,
+  id,
+  className = "",
+  withImageBg = false,
+}: {
+  children: ReactNode;
+  id: string;
+  className?: string;
+  withImageBg?: boolean;
+}) {
   const ref = useRef(null);
   const isInView = useInView(ref, { once: true, margin: "-80px" });
   return (
@@ -279,9 +290,15 @@ function Section({ children, id, className = "" }: { children: ReactNode; id: st
       initial={{ opacity: 0, y: 30 }}
       animate={isInView ? { opacity: 1, y: 0 } : {}}
       transition={{ duration: 0.55, ease: "easeOut" }}
-      className={`py-16 md:py-24 ${className}`}
+      className={`py-16 md:py-24 ${withImageBg ? "relative overflow-hidden" : ""} ${className}`}
     >
-      {children}
+      {withImageBg && (
+        <>
+          <div className="pointer-events-none absolute inset-0 bg-cover bg-center opacity-[0.28]" style={{ backgroundImage: `url(${BG_IMG})` }} />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-background/18 via-background/38 to-background/58" />
+        </>
+      )}
+      <div className={withImageBg ? "relative z-10" : ""}>{children}</div>
     </motion.section>
   );
 }
@@ -376,8 +393,38 @@ function NavBar({ locale, setLocale }: { locale: Locale; setLocale: (locale: Loc
 function HeroSection({ locale }: { locale: Locale }) {
   return (
     <section id="hero" className="relative min-h-[85vh] flex items-end pb-16 pt-20">
-      <div className="absolute inset-0 bg-cover bg-center opacity-[0.08]" style={{ backgroundImage: `url(${BG_IMG})` }} />
-      <div className="container relative z-10">
+      <div className="pointer-events-none absolute inset-0 bg-secondary/30" />
+      <div className="absolute inset-0 z-10">
+        <PointCloudHero
+          csvUrl={`${import.meta.env.BASE_URL}amp-all-3d.csv`}
+          className="h-full w-full"
+          background="#e8ddc6"
+          showLegend
+        />
+      </div>
+      <div
+        id="hero-what-you-are-seeing"
+        className="pointer-events-none absolute right-4 bottom-4 z-30 max-w-sm rounded-lg border border-white/35 bg-black/45 p-3 text-[11px] leading-relaxed text-white/95 shadow-lg backdrop-blur-sm md:text-xs"
+      >
+        <p className="font-semibold tracking-wide mb-1">
+          {t(locale, "What You Are Seeing", "图示说明")}
+        </p>
+        <p>
+          {t(
+            locale,
+            "Each point is one AMP sequence projected from sequence-feature space. Nearby points usually share similar composition and physicochemical patterns.",
+            "每个点代表一条抗菌肽序列在特征空间中的投影位置，越接近通常表示组成与理化性质越相似。"
+          )}
+        </p>
+        <p className="mt-1">
+          {t(
+            locale,
+            "Color indicates sequence-similarity clusters. Drag to rotate, scroll to zoom, and click a point to view cluster and source details.",
+            "颜色表示序列相似性簇。拖拽旋转、滚轮缩放，点击单个点可查看该点的簇和来源信息。"
+          )}
+        </p>
+      </div>
+      <div className="container pointer-events-none relative z-20">
         <div className="max-w-4xl">
           <motion.p
             initial={{ opacity: 0, y: 20 }}
@@ -444,7 +491,7 @@ function HeroSection({ locale }: { locale: Locale }) {
 
 function OverviewSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="overview">
+    <Section id="overview" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="01." />
@@ -552,7 +599,7 @@ function OverviewSection({ locale }: { locale: Locale }) {
 
 function ArchitectureSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="architecture" className="bg-secondary/30">
+    <Section id="architecture" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="03." />
@@ -638,7 +685,7 @@ function ArchitectureSection({ locale }: { locale: Locale }) {
 
 function DataTrainingSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="data">
+    <Section id="data" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="04." />
@@ -717,7 +764,7 @@ function DataTrainingSection({ locale }: { locale: Locale }) {
 
 function GenerationSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="generation" className="bg-secondary/30">
+    <Section id="generation" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="05." />
@@ -835,7 +882,7 @@ function GenerationSection({ locale }: { locale: Locale }) {
 
 function EvaluationSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="evaluation">
+    <Section id="evaluation" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="06." />
@@ -892,7 +939,7 @@ function EvaluationSection({ locale }: { locale: Locale }) {
 
 function LandscapeSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="landscape" className="bg-secondary/30">
+    <Section id="landscape" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="02." />
@@ -989,7 +1036,7 @@ function LandscapeSection({ locale }: { locale: Locale }) {
 
 function RoadmapSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="roadmap">
+    <Section id="roadmap" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="07." />
@@ -1052,7 +1099,7 @@ function RoadmapSection({ locale }: { locale: Locale }) {
 
 function ReferencesSection({ locale }: { locale: Locale }) {
   return (
-    <Section id="references" className="bg-secondary/30">
+    <Section id="references" withImageBg>
       <div className="container">
         <div className="flex items-start mb-10">
           <SectionNumber num="08." />
