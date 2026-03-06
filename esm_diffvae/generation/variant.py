@@ -1,21 +1,20 @@
 """Conditional variant generation: generate biologically realistic AMP variants.
 
-v5: C-terminal focused variant generation.
-Leverages the autoregressive decoder's ability to do partial teacher forcing:
-- Preserves N-terminal region (forced to match parent)
-- Freely generates C-terminal modifications (substitutions, extensions, truncation+regrow)
-- Optionally appends common peptide tags
+v7: Non-autoregressive variant generation.
+Uses the non-autoregressive decoder — decode full sequence from z, then
+splice the parent prefix with generated suffix for C-terminal variants.
 
 Mutation modes:
   c_sub   : Keep first K AAs, substitute the last few (most common in nature)
-  c_ext   : Keep entire parent, extend with 1-5 new AAs at C-terminus
+  c_ext   : Keep entire parent, extend with new AAs at C-terminus
   c_trunc : Truncate last few AAs, regrow from the truncation point
   tag     : Append a common peptide tag (His, FLAG, etc.)
-  latent  : Traditional latent-space perturbation (whole-sequence, for diversity)
+  latent  : Latent-space perturbation (whole-sequence, for diversity)
 """
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -27,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
 from training.dataset import (
     AA_TO_IDX, AA_VOCAB, PAD_IDX,
-    indices_to_sequence, sequence_to_indices, sequence_to_one_hot,
+    indices_to_sequence, sequence_to_indices,
 )
 from training.utils import load_checkpoint
 
@@ -47,70 +46,123 @@ PEPTIDE_TAGS = {
 }
 
 
+def _as_int_choices(value, default_choices):
+    """Normalize config value to a sorted unique list of positive ints."""
+    if isinstance(value, int):
+        return [max(1, int(value))]
+    if not isinstance(value, list) or not value:
+        return list(default_choices)
+
+    if len(value) == 2 and all(isinstance(v, int) for v in value) and value[1] >= value[0]:
+        lo, hi = int(value[0]), int(value[1])
+        lo = max(1, lo)
+        hi = max(lo, hi)
+        return list(range(lo, hi + 1))
+
+    cleaned = sorted({max(1, int(v)) for v in value if isinstance(v, int)})
+    return cleaned if cleaned else list(default_choices)
+
+
+def _normalize_mode_weights(enabled_modes, mode_ratios):
+    """Normalize mode ratios over enabled modes only."""
+    raw = {m: float(mode_ratios.get(m, 0.0)) for m in enabled_modes}
+    positive = {m: w for m, w in raw.items() if w > 0}
+    if not positive:
+        uniform = 1.0 / max(len(enabled_modes), 1)
+        return {m: uniform for m in enabled_modes}
+
+    total = sum(positive.values())
+    return {m: positive.get(m, 0.0) / total for m in enabled_modes}
+
+
+def _allocate_counts(total, weights):
+    """Allocate integer counts from normalized weights (largest-remainder method)."""
+    if total <= 0:
+        return {k: 0 for k in weights}
+    keys = list(weights.keys())
+    raw = {k: total * float(weights[k]) for k in keys}
+    counts = {k: int(math.floor(raw[k])) for k in keys}
+    remainder = total - sum(counts.values())
+    if remainder > 0:
+        order = sorted(keys, key=lambda k: raw[k] - counts[k], reverse=True)
+        for k in order[:remainder]:
+            counts[k] += 1
+    return counts
+
+
+def _dedupe_variants(variants, parent_seq):
+    seen = set()
+    unique = []
+    parent_upper = parent_seq.upper()
+    for v in variants:
+        key = str(v["sequence"]).upper()
+        if key == parent_upper or key in seen:
+            continue
+        seen.add(key)
+        unique.append(v)
+    return unique
+
+
+def _get_variant_cfg(config):
+    gen_cfg = config.get("generation", {})
+    return gen_cfg.get("variant", {}) if isinstance(gen_cfg.get("variant", {}), dict) else {}
+
+
 def encode_parent(model, input_seq, device):
     """Encode parent sequence to latent space."""
     seq_len = len(input_seq)
     with torch.no_grad():
-        one_hot = sequence_to_one_hot(input_seq, model.max_len).unsqueeze(0).to(device)
-        esm_emb = model.esm([input_seq], max_len=model.max_len).to(device)
+        target_indices = sequence_to_indices(input_seq, model.max_len).unsqueeze(0).to(device)
+        aa_features = model.aa_encoding(target_indices)  # [1, L, aa_dim]
+        plm_emb = model.plm([input_seq], max_len=model.max_len).to(device)
         padding_mask = torch.zeros(1, model.max_len, dtype=torch.bool, device=device)
         padding_mask[:, seq_len:] = True
-        mu, logvar = model.encoder(one_hot, esm_emb, padding_mask)
+        mu, logvar = model.encoder(aa_features, plm_emb, padding_mask)
     return mu, logvar
 
 
-def decode_with_prefix(model, z, properties, parent_indices, preserve_len, gen_len, temperature=1.0, top_k=0, top_p=0.9):
-    """Decode autoregressively with partial teacher forcing.
-
-    Forces the first `preserve_len` positions to match `parent_indices`,
-    then freely generates positions `preserve_len` to `gen_len-1`.
+def decode_full(model, z, properties, gen_len, temperature=1.0, top_k=0, top_p=0.9):
+    """Decode z to full sequence using non-autoregressive decoder.
 
     Args:
         model: ESMDiffVAE model.
         z: [B, latent_dim] latent vectors.
         properties: [B, prop_dim] property conditions.
-        parent_indices: [max_len] token indices of parent sequence.
-        preserve_len: Number of N-terminal positions to preserve.
-        gen_len: Total output sequence length.
-        temperature: Sampling temperature for free-running positions.
+        gen_len: Target sequence length.
+        temperature: Sampling temperature.
         top_k: Top-k filtering.
         top_p: Nucleus sampling threshold.
 
     Returns:
-        [B, gen_len] generated token indices.
+        [B, gen_len] sampled token indices.
     """
-    B = z.size(0)
-    device = z.device
-    decoder = model.decoder
+    with torch.no_grad():
+        logits, _ = model.decode(z, properties, target_len=gen_len)
 
-    h = decoder._init_hidden(z, properties)
-    cond = torch.cat([z, properties], dim=-1)
-    cond_step = cond.unsqueeze(1)  # [B, 1, cond_dim]
+    # Suppress padding token
+    logits[..., PAD_IDX] = float("-inf")
+    return _sample_logits_batch(logits, temperature, top_k, top_p)
 
-    bos_idx = decoder.bos_idx
-    input_token = torch.full((B, 1), bos_idx, dtype=torch.long, device=device)
-    all_tokens = []
 
+def splice_with_parent(tokens, parent_indices, preserve_len, device):
+    """Replace the first `preserve_len` positions with parent tokens.
+
+    For non-autoregressive decoder, we generate the full sequence and then
+    splice the parent prefix back in.
+
+    Args:
+        tokens: [B, L] generated token indices.
+        parent_indices: [max_len] parent sequence indices.
+        preserve_len: Number of N-terminal positions to keep from parent.
+        device: torch device.
+
+    Returns:
+        [B, L] token indices with parent prefix spliced in.
+    """
+    result = tokens.clone()
     parent_dev = parent_indices.to(device)
-
-    for t in range(gen_len):
-        emb = decoder.token_embedding(input_token)
-        gru_input = torch.cat([emb, cond_step], dim=-1)
-        output, h = decoder.gru(gru_input, h)
-        logit = decoder.output_proj(output)  # [B, 1, vocab_size]
-
-        if t < preserve_len:
-            # Force to parent token
-            token = parent_dev[t].expand(B, 1)
-        else:
-            # Free generation with sampling
-            token = _sample_step(logit.squeeze(1), temperature, top_k, top_p)
-            token = token.unsqueeze(1)  # [B, 1]
-
-        all_tokens.append(token)
-        input_token = token
-
-    return torch.cat(all_tokens, dim=1)  # [B, gen_len]
+    result[:, :preserve_len] = parent_dev[:preserve_len].unsqueeze(0).expand(tokens.size(0), -1)
+    return result
 
 
 def _sample_step(logits, temperature=1.0, top_k=0, top_p=0.9):
@@ -164,11 +216,8 @@ def generate_c_terminal_substitution(
         std = torch.exp(0.5 * logvar).expand(n_variants, -1)
         z = z + std * torch.randn_like(z) * z_noise
 
-    with torch.no_grad():
-        tokens = decode_with_prefix(
-            model, z, prop, parent_indices, preserve_len, seq_len,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-        )
+    tokens = decode_full(model, z, prop, seq_len, temperature=temperature, top_k=top_k, top_p=top_p)
+    tokens = splice_with_parent(tokens, parent_indices, preserve_len, device)
 
     return _tokens_to_variants(tokens, input_seq, mode="c_sub")
 
@@ -195,11 +244,8 @@ def generate_c_terminal_extension(
         std = torch.exp(0.5 * logvar).expand(n_variants, -1)
         z = z + std * torch.randn_like(z) * z_noise
 
-    with torch.no_grad():
-        tokens = decode_with_prefix(
-            model, z, prop, parent_indices, seq_len, new_len,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-        )
+    tokens = decode_full(model, z, prop, new_len, temperature=temperature, top_k=top_k, top_p=top_p)
+    tokens = splice_with_parent(tokens, parent_indices, seq_len, device)
 
     return _tokens_to_variants(tokens, input_seq, mode="c_ext")
 
@@ -211,7 +257,7 @@ def generate_c_terminal_truncation_regrow(
     """Mode: truncate last few AAs and regrow from that point.
 
     Truncates the last `truncate_by` AAs, then freely regenerates from there
-    to the original length (or slightly different).
+    to the original length.
     """
     seq_len = len(input_seq)
     preserve_len = max(1, seq_len - truncate_by)
@@ -226,30 +272,29 @@ def generate_c_terminal_truncation_regrow(
         std = torch.exp(0.5 * logvar).expand(n_variants, -1)
         z = z + std * torch.randn_like(z) * z_noise
 
-    with torch.no_grad():
-        tokens = decode_with_prefix(
-            model, z, prop, parent_indices, preserve_len, seq_len,
-            temperature=temperature, top_k=top_k, top_p=top_p,
-        )
+    tokens = decode_full(model, z, prop, seq_len, temperature=temperature, top_k=top_k, top_p=top_p)
+    tokens = splice_with_parent(tokens, parent_indices, preserve_len, device)
 
     return _tokens_to_variants(tokens, input_seq, mode="c_trunc")
 
 
-def generate_tag_variants(input_seq, tags=None):
+def generate_tag_variants(input_seq, tags=None, linkers=None, max_len=50):
     """Mode: append peptide tags to the parent sequence.
 
     No model needed — direct sequence manipulation.
     """
     if tags is None:
         tags = list(PEPTIDE_TAGS.keys())
+    if linkers is None:
+        linkers = ["", "GG", "GGGGS"]
 
     variants = []
     for tag_name in tags:
         tag_seq = PEPTIDE_TAGS.get(tag_name, tag_name)
-        # With and without glycine linker
-        for linker in ["", "GG", "GGGGS"]:
+        # With and without configured linkers
+        for linker in linkers:
             variant_seq = input_seq + linker + tag_seq
-            if len(variant_seq) > 50:
+            if len(variant_seq) > max_len:
                 continue
             variants.append({
                 "sequence": variant_seq,
@@ -287,6 +332,39 @@ def generate_latent_variants(
     logits[..., PAD_IDX] = float("-inf")
     tokens = _sample_logits_batch(logits, temperature, top_k, top_p)
     return _tokens_to_variants(tokens, input_seq, mode="latent")
+
+
+def generate_variants(
+    model,
+    input_seq,
+    n_variants=50,
+    variation_strength=0.3,
+    properties=None,
+    guidance_scale=2.0,
+    temperature=1.0,
+    top_k=0,
+    top_p=0.9,
+    device=None,
+):
+    """Backward-compatible variant API used by evaluation scripts."""
+    if device is None:
+        device = next(model.parameters()).device
+    input_seq = input_seq.upper().strip()
+    mu, logvar = encode_parent(model, input_seq, device)
+    return generate_latent_variants(
+        model=model,
+        input_seq=input_seq,
+        mu=mu,
+        logvar=logvar,
+        n_variants=n_variants,
+        variation_strength=variation_strength,
+        properties=properties,
+        guidance_scale=guidance_scale,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        device=device,
+    )
 
 
 def _default_properties(seq_len):
@@ -387,81 +465,150 @@ def generate_all_variants(
     model, input_seq, mu, logvar, config, device,
     n_variants=50, properties=None,
 ):
-    """Generate variants using a mix of biologically realistic modes.
-
-    Distribution:
-      40% C-terminal substitution (1-5 positions)
-      20% C-terminal extension (1-5 AAs)
-      15% C-terminal truncation + regrow
-      10% Tag addition
-      15% Latent perturbation (for diversity)
-    """
+    """Generate mixed variants according to config-driven mode ratios and strengths."""
     gen_cfg = config.get("generation", {})
-    temperature = gen_cfg.get("temperature", 0.8)
-    top_k = gen_cfg.get("top_k", 10)
-    top_p = gen_cfg.get("top_p", 0.9)
+    var_cfg = _get_variant_cfg(config)
+
+    global_temp = float(var_cfg.get("temperature", gen_cfg.get("temperature", 0.8)))
+    global_top_k = int(var_cfg.get("top_k", gen_cfg.get("top_k", 10)))
+    global_top_p = float(var_cfg.get("top_p", gen_cfg.get("top_p", 0.9)))
+
+    enabled_modes = var_cfg.get("enabled_modes", ["c_sub", "c_ext", "c_trunc", "tag", "latent"])
+    enabled_modes = [m for m in enabled_modes if m in {"c_sub", "c_ext", "c_trunc", "tag", "latent"}]
+    if not enabled_modes:
+        enabled_modes = ["latent"]
+    mode_ratios = var_cfg.get(
+        "mode_ratios",
+        {"c_sub": 0.4, "c_ext": 0.2, "c_trunc": 0.15, "tag": 0.1, "latent": 0.15},
+    )
+    mode_weights = _normalize_mode_weights(enabled_modes, mode_ratios)
+    mode_counts = _allocate_counts(n_variants, mode_weights)
 
     all_variants = []
+    for mode in enabled_modes:
+        target_n = int(mode_counts.get(mode, 0))
+        if target_n <= 0:
+            continue
 
-    # C-terminal substitution (largest group)
-    n_csub = max(1, int(n_variants * 0.4))
-    for n_pos in [1, 2, 3, 4, 5]:
-        batch_n = max(1, n_csub // 5)
-        variants = generate_c_terminal_substitution(
-            model, input_seq, mu, logvar, n_variants=batch_n * 3,
-            n_positions=n_pos, properties=properties,
-            z_noise=0.1, temperature=temperature, top_k=top_k, top_p=top_p, device=device,
-        )
-        all_variants.extend(variants[:batch_n])
+        if mode == "c_sub":
+            cfg = var_cfg.get("c_sub", {})
+            choices = _as_int_choices(cfg.get("n_positions", [1, 5]), [1, 2, 3, 4, 5])
+            sub_counts = _allocate_counts(target_n, {str(v): 1.0 for v in choices})
+            oversample = max(1, int(cfg.get("oversample_factor", 3)))
+            mode_candidates = []
+            for n_pos in choices:
+                need = int(sub_counts[str(n_pos)])
+                if need <= 0:
+                    continue
+                mode_candidates.extend(
+                    generate_c_terminal_substitution(
+                        model, input_seq, mu, logvar,
+                        n_variants=max(need * oversample, need),
+                        n_positions=n_pos,
+                        properties=properties,
+                        z_noise=float(cfg.get("z_noise", 0.10)),
+                        temperature=float(cfg.get("temperature", global_temp)),
+                        top_k=int(cfg.get("top_k", global_top_k)),
+                        top_p=float(cfg.get("top_p", global_top_p)),
+                        device=device,
+                    )
+                )
+            mode_selected = _dedupe_variants(mode_candidates, input_seq)[:target_n]
+            all_variants.extend(mode_selected)
 
-    # C-terminal extension
-    n_cext = max(1, int(n_variants * 0.2))
-    for ext in [1, 2, 3, 4, 5]:
-        batch_n = max(1, n_cext // 5)
-        variants = generate_c_terminal_extension(
-            model, input_seq, mu, logvar, n_variants=batch_n * 3,
-            extend_by=ext, properties=properties,
-            z_noise=0.1, temperature=temperature, top_k=top_k, top_p=top_p, device=device,
-        )
-        all_variants.extend(variants[:batch_n])
+        elif mode == "c_ext":
+            cfg = var_cfg.get("c_ext", {})
+            choices = _as_int_choices(cfg.get("extend_by", [1, 5]), [1, 2, 3, 4, 5])
+            sub_counts = _allocate_counts(target_n, {str(v): 1.0 for v in choices})
+            oversample = max(1, int(cfg.get("oversample_factor", 3)))
+            mode_candidates = []
+            for extend_by in choices:
+                need = int(sub_counts[str(extend_by)])
+                if need <= 0:
+                    continue
+                mode_candidates.extend(
+                    generate_c_terminal_extension(
+                        model, input_seq, mu, logvar,
+                        n_variants=max(need * oversample, need),
+                        extend_by=extend_by,
+                        properties=properties,
+                        z_noise=float(cfg.get("z_noise", 0.10)),
+                        temperature=float(cfg.get("temperature", global_temp)),
+                        top_k=int(cfg.get("top_k", global_top_k)),
+                        top_p=float(cfg.get("top_p", global_top_p)),
+                        device=device,
+                    )
+                )
+            mode_selected = _dedupe_variants(mode_candidates, input_seq)[:target_n]
+            all_variants.extend(mode_selected)
 
-    # C-terminal truncation + regrow
-    n_ctrunc = max(1, int(n_variants * 0.15))
-    for trunc in [2, 3, 4, 5]:
-        batch_n = max(1, n_ctrunc // 4)
-        variants = generate_c_terminal_truncation_regrow(
-            model, input_seq, mu, logvar, n_variants=batch_n * 3,
-            truncate_by=trunc, properties=properties,
-            z_noise=0.15, temperature=0.9, top_k=top_k, top_p=top_p, device=device,
-        )
-        all_variants.extend(variants[:batch_n])
+        elif mode == "c_trunc":
+            cfg = var_cfg.get("c_trunc", {})
+            choices = _as_int_choices(cfg.get("truncate_by", [2, 5]), [2, 3, 4, 5])
+            sub_counts = _allocate_counts(target_n, {str(v): 1.0 for v in choices})
+            oversample = max(1, int(cfg.get("oversample_factor", 3)))
+            mode_candidates = []
+            for truncate_by in choices:
+                need = int(sub_counts[str(truncate_by)])
+                if need <= 0:
+                    continue
+                mode_candidates.extend(
+                    generate_c_terminal_truncation_regrow(
+                        model, input_seq, mu, logvar,
+                        n_variants=max(need * oversample, need),
+                        truncate_by=truncate_by,
+                        properties=properties,
+                        z_noise=float(cfg.get("z_noise", 0.15)),
+                        temperature=float(cfg.get("temperature", 0.9)),
+                        top_k=int(cfg.get("top_k", global_top_k)),
+                        top_p=float(cfg.get("top_p", global_top_p)),
+                        device=device,
+                    )
+                )
+            mode_selected = _dedupe_variants(mode_candidates, input_seq)[:target_n]
+            all_variants.extend(mode_selected)
 
-    # Tag addition (no model needed)
-    tag_variants = generate_tag_variants(input_seq)
-    all_variants.extend(tag_variants)
+        elif mode == "tag":
+            cfg = var_cfg.get("tag", {})
+            tags = cfg.get("tags", list(PEPTIDE_TAGS.keys()))
+            linkers = cfg.get("linkers", ["", "GG", "GGGGS"])
+            mode_candidates = generate_tag_variants(
+                input_seq,
+                tags=tags,
+                linkers=linkers,
+                max_len=model.max_len,
+            )
+            random.shuffle(mode_candidates)
+            mode_selected = _dedupe_variants(mode_candidates, input_seq)[:target_n]
+            all_variants.extend(mode_selected)
 
-    # Latent perturbation (for diversity)
-    n_latent = max(1, int(n_variants * 0.15))
-    variation_strength = gen_cfg.get("default_variation_strength", 0.2)
-    guidance_scale = config.get("diffusion", {}).get("guidance_scale", 1.2)
-    latent_variants = generate_latent_variants(
-        model, input_seq, mu, logvar, n_variants=n_latent * 3,
-        variation_strength=variation_strength, properties=properties,
-        guidance_scale=guidance_scale,
-        temperature=1.0, top_k=0, top_p=top_p, device=device,
-    )
-    all_variants.extend(latent_variants[:n_latent])
+        elif mode == "latent":
+            cfg = var_cfg.get("latent", {})
+            oversample = max(1, int(cfg.get("oversample_factor", 3)))
+            guidance_scale = float(
+                cfg.get("guidance_scale", config.get("diffusion", {}).get("guidance_scale", 1.2))
+            )
+            variation_strength = float(
+                cfg.get(
+                    "variation_strength",
+                    var_cfg.get("default_variation_strength", gen_cfg.get("default_variation_strength", 0.2)),
+                )
+            )
+            mode_candidates = generate_latent_variants(
+                model, input_seq, mu, logvar,
+                n_variants=max(target_n * oversample, target_n),
+                variation_strength=variation_strength,
+                properties=properties,
+                guidance_scale=guidance_scale,
+                temperature=float(cfg.get("temperature", 1.0)),
+                top_k=int(cfg.get("top_k", 0)),
+                top_p=float(cfg.get("top_p", global_top_p)),
+                device=device,
+            )
+            mode_selected = _dedupe_variants(mode_candidates, input_seq)[:target_n]
+            all_variants.extend(mode_selected)
 
-    # Deduplicate
-    seen = set()
-    unique = []
-    for v in all_variants:
-        key = v["sequence"].upper()
-        if key not in seen and key != input_seq.upper():
-            seen.add(key)
-            unique.append(v)
-
-    # Sort by identity (high first), then by mode for grouping
+    unique = _dedupe_variants(all_variants, input_seq)
     unique.sort(key=lambda v: (-v["identity"], v.get("mode", "")))
     return unique[:n_variants]
 
@@ -471,20 +618,20 @@ def main():
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "default.yaml"))
     parser.add_argument("--checkpoint", required=True, help="Model checkpoint path")
     parser.add_argument("--input-sequence", required=True, help="Parent AMP sequence")
-    parser.add_argument("--n-variants", type=int, default=50)
-    parser.add_argument("--mode", default="mixed",
+    parser.add_argument("--n-variants", type=int, default=None)
+    parser.add_argument("--mode", default=None,
                         choices=["mixed", "c_sub", "c_ext", "c_trunc", "tag", "latent"],
                         help="Variant generation mode")
-    parser.add_argument("--n-positions", type=int, default=3,
+    parser.add_argument("--n-positions", type=int, default=None,
                         help="Number of C-terminal positions to modify (c_sub/c_trunc)")
-    parser.add_argument("--extend-by", type=int, default=3,
+    parser.add_argument("--extend-by", type=int, default=None,
                         help="Number of AAs to extend (c_ext)")
-    parser.add_argument("--variation-strength", type=float, default=0.2,
+    parser.add_argument("--variation-strength", type=float, default=None,
                         help="Latent perturbation strength (latent mode)")
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-k", type=int, default=10)
-    parser.add_argument("--top-p", type=float, default=0.9)
-    parser.add_argument("--z-noise", type=float, default=0.1,
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--z-noise", type=float, default=None,
                         help="Noise scale for z perturbation")
     parser.add_argument("--output", default=None)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -492,6 +639,13 @@ def main():
 
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    gen_cfg = config.get("generation", {})
+    var_cfg = _get_variant_cfg(config)
+    mode = args.mode or var_cfg.get("mode", "mixed")
+    n_variants = int(args.n_variants if args.n_variants is not None else var_cfg.get("n_variants", 50))
+    global_temp = float(args.temperature if args.temperature is not None else var_cfg.get("temperature", gen_cfg.get("temperature", 0.8)))
+    global_top_k = int(args.top_k if args.top_k is not None else var_cfg.get("top_k", gen_cfg.get("top_k", 10)))
+    global_top_p = float(args.top_p if args.top_p is not None else var_cfg.get("top_p", gen_cfg.get("top_p", 0.9)))
 
     device = torch.device(args.device)
     model = ESMDiffVAE(config).to(device)
@@ -500,47 +654,82 @@ def main():
 
     input_seq = args.input_sequence.upper().strip()
     print(f"Input sequence: {input_seq} (len={len(input_seq)})")
-    print(f"Mode: {args.mode}")
+    print(f"Mode: {mode}")
 
     # Encode parent
     mu, logvar = encode_parent(model, input_seq, device)
 
-    if args.mode == "mixed":
+    if mode == "mixed":
         variants = generate_all_variants(
             model, input_seq, mu, logvar, config, device,
-            n_variants=args.n_variants,
+            n_variants=n_variants,
         )
-    elif args.mode == "c_sub":
+    elif mode == "c_sub":
+        csub_cfg = var_cfg.get("c_sub", {})
+        n_positions = int(args.n_positions if args.n_positions is not None else csub_cfg.get("default_n_positions", 3))
+        z_noise = float(args.z_noise if args.z_noise is not None else csub_cfg.get("z_noise", 0.1))
         variants = generate_c_terminal_substitution(
             model, input_seq, mu, logvar,
-            n_variants=args.n_variants, n_positions=args.n_positions,
-            z_noise=args.z_noise, temperature=args.temperature,
-            top_k=args.top_k, top_p=args.top_p, device=device,
+            n_variants=n_variants, n_positions=n_positions,
+            z_noise=z_noise,
+            temperature=float(csub_cfg.get("temperature", global_temp)),
+            top_k=int(csub_cfg.get("top_k", global_top_k)),
+            top_p=float(csub_cfg.get("top_p", global_top_p)),
+            device=device,
         )
-    elif args.mode == "c_ext":
+    elif mode == "c_ext":
+        cext_cfg = var_cfg.get("c_ext", {})
+        extend_by = int(args.extend_by if args.extend_by is not None else cext_cfg.get("default_extend_by", 3))
+        z_noise = float(args.z_noise if args.z_noise is not None else cext_cfg.get("z_noise", 0.1))
         variants = generate_c_terminal_extension(
             model, input_seq, mu, logvar,
-            n_variants=args.n_variants, extend_by=args.extend_by,
-            z_noise=args.z_noise, temperature=args.temperature,
-            top_k=args.top_k, top_p=args.top_p, device=device,
+            n_variants=n_variants, extend_by=extend_by,
+            z_noise=z_noise,
+            temperature=float(cext_cfg.get("temperature", global_temp)),
+            top_k=int(cext_cfg.get("top_k", global_top_k)),
+            top_p=float(cext_cfg.get("top_p", global_top_p)),
+            device=device,
         )
-    elif args.mode == "c_trunc":
+    elif mode == "c_trunc":
+        ctrunc_cfg = var_cfg.get("c_trunc", {})
+        truncate_by = int(args.n_positions if args.n_positions is not None else ctrunc_cfg.get("default_truncate_by", 3))
+        z_noise = float(args.z_noise if args.z_noise is not None else ctrunc_cfg.get("z_noise", 0.15))
         variants = generate_c_terminal_truncation_regrow(
             model, input_seq, mu, logvar,
-            n_variants=args.n_variants, truncate_by=args.n_positions,
-            z_noise=args.z_noise, temperature=args.temperature,
-            top_k=args.top_k, top_p=args.top_p, device=device,
+            n_variants=n_variants, truncate_by=truncate_by,
+            z_noise=z_noise,
+            temperature=float(ctrunc_cfg.get("temperature", 0.9)),
+            top_k=int(ctrunc_cfg.get("top_k", global_top_k)),
+            top_p=float(ctrunc_cfg.get("top_p", global_top_p)),
+            device=device,
         )
-    elif args.mode == "tag":
-        variants = generate_tag_variants(input_seq)
-    elif args.mode == "latent":
-        guidance_scale = config.get("diffusion", {}).get("guidance_scale", 1.2)
+    elif mode == "tag":
+        tag_cfg = var_cfg.get("tag", {})
+        variants = generate_tag_variants(
+            input_seq,
+            tags=tag_cfg.get("tags", list(PEPTIDE_TAGS.keys())),
+            linkers=tag_cfg.get("linkers", ["", "GG", "GGGGS"]),
+            max_len=model.max_len,
+        )
+    elif mode == "latent":
+        latent_cfg = var_cfg.get("latent", {})
+        guidance_scale = float(latent_cfg.get("guidance_scale", config.get("diffusion", {}).get("guidance_scale", 1.2)))
+        variation_strength = float(
+            args.variation_strength
+            if args.variation_strength is not None
+            else latent_cfg.get(
+                "variation_strength",
+                var_cfg.get("default_variation_strength", gen_cfg.get("default_variation_strength", 0.2)),
+            )
+        )
         variants = generate_latent_variants(
             model, input_seq, mu, logvar,
-            n_variants=args.n_variants,
-            variation_strength=args.variation_strength,
+            n_variants=n_variants,
+            variation_strength=variation_strength,
             guidance_scale=guidance_scale,
-            temperature=args.temperature, top_k=args.top_k, top_p=args.top_p,
+            temperature=float(latent_cfg.get("temperature", global_temp)),
+            top_k=int(latent_cfg.get("top_k", global_top_k)),
+            top_p=float(latent_cfg.get("top_p", global_top_p)),
             device=device,
         )
     else:
@@ -602,7 +791,7 @@ def main():
     with open(metrics_path, "w") as f:
         json.dump({
             "input_sequence": input_seq,
-            "mode": args.mode,
+            "mode": mode,
             "n_generated": len(variants),
             "variants": variants,
         }, f, indent=2)

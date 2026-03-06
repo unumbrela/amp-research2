@@ -1,22 +1,43 @@
-# ESM-DiffVAE v5 Configuration
+# ESM-DiffVAE v8 Configuration
 
-# ESM-2 Feature Extractor
-esm:
-  model_name: "esm2_t6_8M_UR50D"
-  embedding_dim: 320
+# Protein Language Model (PLM) Feature Extractor
+# Supports: esm2, ankh, prot_t5
+# plm:
+#   backend: "esm2"                    # "esm2" | "ankh" | "prot_t5"
+#   model_name: "esm2_t6_8M_UR50D"    # esm2: esm2_t6_8M_UR50D (320d), esm2_t12_35M_UR50D (480d)
+#   embedding_dim: 320                 # ankh: ankh-base (768d), ankh-large (1536d)
+#                                      # prot_t5: prot_t5_xl_half (1024d)
+# plm:
+#   backend: "ankh"                    # "esm2" | "ankh" | "prot_t5"
+#   model_name: "ankh-base"    # esm2: esm2_t6_8M_UR50D (320d), esm2_t12_35M_UR50D (480d)
+#   embedding_dim: 768                 # ankh: ankh-base (768d), ankh-large (1536d)
+#                                      # prot_t5: prot_t5_xl_half (1024d)
+plm:
+  backend: "prot_t5"                    # "esm2" | "ankh" | "prot_t5"
+  model_name: "prot_t5_xl_half"    # esm2: esm2_t6_8M_UR50D (320d), esm2_t12_35M_UR50D (480d)
+  embedding_dim: 1024                 # ankh: ankh-base (768d), ankh-large (1536d)
+                                     # prot_t5: prot_t5_xl_half (1024d)
 
-# VAE Architecture (v5: GRU encoder + autoregressive GRU decoder with z-injection)
+# Amino Acid Encoding
+encoding:
+  type: "hybrid"                     # "hybrid" (BLOSUM62+learned) | "one_hot"
+  learned_embed_dim: 16              # learnable embedding dimension (hybrid only)
+  # output_dim: 36                   # auto: blosum(20) + learned(16) = 36
+
+# VAE Architecture (v8: BiGRU encoder + non-autoregressive Transformer decoder)
 vae:
   aa_vocab_size: 21
-  max_seq_len: 50
-  hidden_dim: 256             # encoder GRU hidden per direction
-  latent_dim: 64              # 128 → 64: smaller latent for 6.6K dataset
-  n_encoder_layers: 1         # single bidirectional GRU layer
-  n_decoder_layers: 2         # decoder GRU layers
-  decoder_hidden_dim: 384     # decoder GRU hidden dim
-  decoder_embedding_dim: 64   # token embedding dim for decoder input
-  dropout: 0.2                # 0.3 → 0.2: less dropout with word_dropout active
-  word_dropout: 0.25          # NEW: randomly replace 25% of decoder inputs with BOS
+  max_seq_len: 50                # matched to dataset max length (was 50)
+  hidden_dim: 256                # encoder GRU hidden per direction
+  latent_dim: 64                 # smaller latent for 6.6K dataset
+  n_encoder_layers: 1            # single bidirectional GRU layer
+  n_decoder_layers: 3            # Transformer self-attention layers
+  decoder_hidden_dim: 128        # smaller decoder to prevent overfitting
+  decoder_n_heads: 4             # attention heads (head_dim = 32)
+  decoder_ffn_dim: 256           # FFN intermediate dim (2× hidden)
+  decoder_embedding_dim: 64      # kept for compatibility
+  dropout: 0.2                   # increased for small dataset
+  word_dropout: 0.0              # unused in non-AR decoder
 
 # Property Conditioning
 properties:
@@ -33,31 +54,43 @@ diffusion:
   guidance_scale: 1.2
   cfg_drop_prob: 0.1
 
-# VAE Training
+# VAE Training (Phase 1A: MLE pre-training)
 train_vae:
-  epochs: 400                   # 300 → 400: more training with cyclical KL
+  epochs: 300
   batch_size: 64
-  lr: 3.0e-4                    # 5e-4 → 3e-4: slightly lower for stability
+  lr: 3.0e-4
   weight_decay: 1.0e-4
   grad_clip: 1.0
-  beta_max: 0.25                # 0.5 → 0.25: less KL pressure, better reconstruction
-  beta_warmup_epochs: 200       # 30 → 200: total annealing epochs (across cycles)
-  kl_n_cycles: 4                # NEW: 4 cyclical annealing cycles
-  kl_ratio_ramp: 0.5            # NEW: 50% ramp, 50% hold per cycle
-  free_bits: 0.05               # NEW: minimum 0.05 nats per latent dim
-  lambda_contrastive: 0.2       # 0.3 → 0.2: reduce auxiliary loss weight
-  lambda_property: 0.2          # 0.3 → 0.2: reduce auxiliary loss weight
+  beta_max: 0.6 # was 1                  # stronger KL regularization (was 0.25)
+  beta_warmup_epochs: 100        # faster warmup (was 200)
+  kl_n_cycles: 2                 # fewer cycles (was 4)
+  kl_ratio_ramp: 0.5
+  free_bits: 0.05                 # prevent posterior collapse (was 0.05)
+  lambda_contrastive: 0.0        # disabled: single-label SupCon too strong
+  lambda_property: 0.0           # disabled: mic/toxic/hemolytic all NULL
   lambda_length: 0.2
-  early_stopping_patience: 80   # 25 → 40: allow cyclical KL to recover
-  label_smoothing: 0.05         # 0.1 → 0.05: less smoothing for sharper predictions
-  one_hot_dropout_prob: 0.1     # 0.15 → 0.1: word_dropout handles regularization
-  esm_noise_std: 0.03           # 0.05 → 0.03: less noise
+  early_stopping_patience: 40
+  label_smoothing: 0.02          # reduced for 21-class vocab (was 0.05)
+  esm_noise_std: 0.02
   ema_decay: 0.999
   fp16: true
-  # Teacher forcing schedule (v5)
-  teacher_forcing_start: 1.0    # initial ratio (full teacher forcing)
-  teacher_forcing_end: 0.6      # 0.5 → 0.6: keep more teacher forcing
-  teacher_forcing_warmup: 150   # 100 → 150: slower decay
+  # Teacher forcing is not used in non-AR decoder, kept for compatibility
+  teacher_forcing_start: 1.0
+  teacher_forcing_end: 1.0
+  teacher_forcing_warmup: 0
+
+# RL Fine-tuning (Phase 1B: adversarial refinement)
+train_vae_rl:
+  epochs: 50
+  lr: 1.0e-5
+  disc_lr: 1.0e-4
+  rl_weight: 0.5
+  disc_steps_per_gen_step: 3
+  temperature: 0.8
+  disc_embed_dim: 32
+  disc_hidden_dim: 64
+  fp16: true
+  grad_clip: 1.0
 
 # Diffusion Training
 train_diffusion:
@@ -72,11 +105,86 @@ train_diffusion:
 
 # Generation
 generation:
-  default_variation_strength: 0.1
+  # Legacy defaults (still used as fallback)
+  default_variation_strength: 0.2
   n_samples: 100
-  temperature: 1.1
-  top_k: 20
-  top_p: 0.95
+  temperature: 0.8
+  top_k: 10
+  top_p: 0.9
+
+  # Unconditional generation (sample from diffusion prior)
+  unconditional:
+    n_samples: 100
+    guidance_scale: 1.2
+    temperature: 1.0
+    top_p: 0.9
+
+  # Conditional variant generation (given a parent sequence)
+  variant:
+    mode: "mixed"           # "mixed" | "c_sub" | "c_ext" | "c_trunc" | "tag" | "latent"
+    n_variants: 50
+    enabled_modes: ["c_sub", "c_ext", "c_trunc", "tag", "latent"]
+
+    # Ratio control in mixed mode (weights; auto-normalized)
+    mode_ratios:
+      c_sub: 0.40
+      c_ext: 0.20
+      c_trunc: 0.15
+      tag: 0.10
+      latent: 0.15
+
+    # Global fallback sampling params for variant generation
+    temperature: 0.8
+    top_k: 10
+    top_p: 0.9
+
+    c_sub:
+      n_positions: [1, 2, 3]   # or [1, 5] for inclusive range
+      default_n_positions: 3
+      z_noise: 0.10
+      oversample_factor: 3
+      temperature: 0.8
+      top_k: 10
+      top_p: 0.9
+
+    c_ext:
+      extend_by: [1, 2, 3, 4, 5]      # or [1, 3] for inclusive range
+      default_extend_by: 3
+      z_noise: 0.10
+      oversample_factor: 3
+      temperature: 0.8
+      top_k: 10
+      top_p: 0.9
+
+    c_trunc:
+      truncate_by: [2, 3, 4, 5]       # or [2, 4] for inclusive range
+      default_truncate_by: 3
+      z_noise: 0.15
+      oversample_factor: 3
+      temperature: 0.9
+      top_k: 10
+      top_p: 0.9
+
+    latent:
+      variation_strength: 0.2
+      guidance_scale: 1.2
+      oversample_factor: 3
+      temperature: 1.0
+      top_k: 0
+      top_p: 0.9
+
+    tag:
+      tags: ["his6", "his8", "flag", "strep", "myc", "ha", "gly_linker", "ala_linker"]
+      linkers: ["", "GG", "GGGGS"]
+
+  # Evaluation-time generation settings
+  evaluation:
+    uncond_n_samples: 500
+    variant_strengths: [0.1, 0.3, 0.5]
+    variant_n_samples: 50
+    variant_hist_strength: 0.3
+    variant_hist_n_samples: 100
+
   filtering:
     min_identity: 0.65
     max_identity: 0.9
@@ -99,5 +207,7 @@ data:
 # Paths
 paths:
   data_dir: "data"
+  processed_dir: "processed"
+  embeddings_dir: "embeddings"
   checkpoint_dir: "checkpoints"
   results_dir: "results"

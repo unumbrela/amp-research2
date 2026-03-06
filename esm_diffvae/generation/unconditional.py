@@ -16,6 +16,30 @@ from training.utils import load_checkpoint
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
+def resolve_unconditional_params(
+    config: dict,
+    n_samples: int | None = None,
+    guidance_scale: float | None = None,
+    temperature: float | None = None,
+    top_p: float | None = None,
+) -> dict:
+    """Resolve unconditional generation params from config with optional overrides."""
+    gen_cfg = config.get("generation", {})
+    uncond_cfg = gen_cfg.get("unconditional", {})
+    diff_cfg = config.get("diffusion", {})
+
+    return {
+        "n_samples": int(n_samples if n_samples is not None else uncond_cfg.get("n_samples", gen_cfg.get("n_samples", 100))),
+        "guidance_scale": float(
+            guidance_scale
+            if guidance_scale is not None
+            else uncond_cfg.get("guidance_scale", diff_cfg.get("guidance_scale", 1.2))
+        ),
+        "temperature": float(temperature if temperature is not None else uncond_cfg.get("temperature", gen_cfg.get("temperature", 1.0))),
+        "top_p": float(top_p if top_p is not None else uncond_cfg.get("top_p", gen_cfg.get("top_p", 0.9))),
+    }
+
+
 def generate_unconditional(
     model: ESMDiffVAE,
     n_samples: int = 100,
@@ -122,10 +146,10 @@ def main():
     parser = argparse.ArgumentParser(description="Generate AMPs unconditionally")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "configs" / "default.yaml"))
     parser.add_argument("--checkpoint", required=True, help="Model checkpoint path")
-    parser.add_argument("--n-samples", type=int, default=100)
-    parser.add_argument("--guidance-scale", type=float, default=2.0)
-    parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top-p", type=float, default=0.9)
+    parser.add_argument("--n-samples", type=int, default=None)
+    parser.add_argument("--guidance-scale", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
     parser.add_argument("--output", default=None, help="Output file path")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
@@ -138,12 +162,22 @@ def main():
     load_checkpoint(model, args.checkpoint, device=args.device)
     print(f"Loaded model from {args.checkpoint}")
 
-    print(f"\nGenerating {args.n_samples} AMP sequences...")
-    sequences = generate_unconditional(
-        model, args.n_samples,
+    gen_params = resolve_unconditional_params(
+        config,
+        n_samples=args.n_samples,
         guidance_scale=args.guidance_scale,
         temperature=args.temperature,
         top_p=args.top_p,
+    )
+    print(
+        f"\nGenerating {gen_params['n_samples']} AMP sequences "
+        f"(guidance={gen_params['guidance_scale']}, temp={gen_params['temperature']}, top_p={gen_params['top_p']})..."
+    )
+    sequences = generate_unconditional(
+        model, gen_params["n_samples"],
+        guidance_scale=gen_params["guidance_scale"],
+        temperature=gen_params["temperature"],
+        top_p=gen_params["top_p"],
         device=device,
     )
 

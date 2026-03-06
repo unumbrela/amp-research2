@@ -1,6 +1,7 @@
 """Training utilities: checkpointing, logging, metrics."""
 
 import json
+import logging
 from pathlib import Path
 
 import torch
@@ -75,6 +76,51 @@ class TrainingLogger:
                 for line in f:
                     entries.append(json.loads(line.strip()))
         return entries
+
+
+class RunLogger:
+    """Structured run logger for train/val/events/final results."""
+
+    def __init__(self, run_dir: str | Path, append: bool = True):
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.train_path = self.run_dir / "train_metrics.jsonl"
+        self.val_path = self.run_dir / "val_metrics.jsonl"
+        self.event_path = self.run_dir / "events.log"
+        self.result_path = self.run_dir / "result_summary.json"
+
+        if not append:
+            for path in (self.train_path, self.val_path, self.event_path, self.result_path):
+                if path.exists():
+                    path.unlink()
+
+        self._logger = logging.getLogger(f"esm_diffvae.run.{self.run_dir.as_posix()}")
+        self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+        self._logger.handlers = []
+        handler = logging.FileHandler(self.event_path, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        self._logger.addHandler(handler)
+
+    def _write_jsonl(self, path: Path, payload: dict):
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def log_metrics(self, epoch: int, metrics: dict, phase: str):
+        payload = {"epoch": int(epoch), "phase": phase, **metrics}
+        if phase == "train":
+            self._write_jsonl(self.train_path, payload)
+        elif phase == "val":
+            self._write_jsonl(self.val_path, payload)
+        else:
+            raise ValueError(f"Unknown phase: {phase}")
+
+    def info(self, message: str):
+        self._logger.info(message)
+
+    def write_result(self, result: dict):
+        with open(self.result_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
 
 
 class EarlyStopping:

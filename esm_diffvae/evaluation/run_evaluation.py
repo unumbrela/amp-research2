@@ -16,7 +16,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
 from training.utils import load_checkpoint
-from generation.unconditional import generate_unconditional
+from generation.unconditional import generate_unconditional, resolve_unconditional_params
 from generation.variant import generate_variants
 from evaluation.metrics import (
     full_evaluation, compute_aa_composition, NATURAL_AMP_AA_FREQ,
@@ -44,13 +44,15 @@ def evaluate_unconditional(model, config, device, results_dir, training_seqs=Non
     """Evaluate unconditional generation."""
     print("\n=== Unconditional Generation Evaluation ===")
 
-    n_samples = 500
+    eval_cfg = config.get("generation", {}).get("evaluation", {})
+    uncond_params = resolve_unconditional_params(config)
+    n_samples = int(eval_cfg.get("uncond_n_samples", 500))
     print(f"Generating {n_samples} sequences...")
     sequences = generate_unconditional(
         model, n_samples=n_samples,
-        guidance_scale=config["diffusion"]["guidance_scale"],
-        temperature=config["generation"]["temperature"],
-        top_p=config["generation"]["top_p"],
+        guidance_scale=uncond_params["guidance_scale"],
+        temperature=uncond_params["temperature"],
+        top_p=uncond_params["top_p"],
         device=device,
     )
     print(f"  Got {len(sequences)} valid sequences")
@@ -93,6 +95,15 @@ def evaluate_variants(model, config, device, results_dir):
 
     all_variant_results = {}
 
+    eval_cfg = config.get("generation", {}).get("evaluation", {})
+    strengths = eval_cfg.get("variant_strengths", [0.1, 0.3, 0.5])
+    n_variant_samples = int(eval_cfg.get("variant_n_samples", 50))
+    hist_strength = float(eval_cfg.get("variant_hist_strength", 0.3))
+    hist_n_samples = int(eval_cfg.get("variant_hist_n_samples", 100))
+    guidance = config.get("generation", {}).get("variant", {}).get(
+        "latent", {}
+    ).get("guidance_scale", config.get("diffusion", {}).get("guidance_scale", 1.2))
+
     for name, parent_seq in BENCHMARK_AMPS.items():
         if len(parent_seq) > config["vae"]["max_seq_len"]:
             print(f"\n  Skipping {name}: too long ({len(parent_seq)} > {config['vae']['max_seq_len']})")
@@ -100,12 +111,12 @@ def evaluate_variants(model, config, device, results_dir):
 
         print(f"\n  {name}: {parent_seq} (len={len(parent_seq)})")
 
-        for strength in [0.1, 0.3, 0.5]:
+        for strength in strengths:
             variants = generate_variants(
                 model, parent_seq,
-                n_variants=50,
+                n_variants=n_variant_samples,
                 variation_strength=strength,
-                guidance_scale=config["diffusion"]["guidance_scale"],
+                guidance_scale=guidance,
                 device=device,
             )
 
@@ -133,7 +144,7 @@ def evaluate_variants(model, config, device, results_dir):
 
         # Identity histogram for moderate strength
         moderate_variants = generate_variants(
-            model, parent_seq, n_variants=100, variation_strength=0.3, device=device,
+            model, parent_seq, n_variants=hist_n_samples, variation_strength=hist_strength, device=device,
         )
         identities = [v["identity"] for v in moderate_variants]
         plot_variant_identity_histogram(identities, results_dir / f"identity_hist_{name}.png")
@@ -169,8 +180,12 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Load training sequences for novelty check
-    train_csv = PROJECT_ROOT / config["paths"]["data_dir"] / "processed" / "train.csv"
+    paths_cfg = config["paths"]
+    data_dir = PROJECT_ROOT / paths_cfg["data_dir"]
+    processed_dir = data_dir / paths_cfg.get("processed_dir", "processed")
+    train_csv = processed_dir / "train.csv"
     training_seqs = None
+    print(f"Novelty reference CSV: {train_csv.resolve()}")
     if train_csv.exists():
         training_seqs = pd.read_csv(train_csv)["sequence"].tolist()
         print(f"Loaded {len(training_seqs)} training sequences for novelty check")

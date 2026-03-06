@@ -5,6 +5,7 @@ then trains the diffusion denoising network on these latent representations.
 """
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -14,11 +15,53 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
+from models.plm_extractor import BACKEND_REGISTRY
 from training.dataset import create_dataloader
 from training.utils import save_checkpoint, load_checkpoint, TrainingLogger, EarlyStopping
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _count_csv_rows(path: Path) -> int:
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        n = sum(1 for _ in reader)
+    return max(0, n - 1)
+
+
+def _resolve_plm_setup(config: dict) -> tuple[str, str, int, str]:
+    """Resolve backend/model/dim and embedding filename suffix from config."""
+    plm_cfg = config.get("plm", config.get("esm", {}))
+    backend = plm_cfg.get("backend", "esm2")
+    if backend not in BACKEND_REGISTRY:
+        raise ValueError(f"Unknown PLM backend '{backend}'. Choose from {list(BACKEND_REGISTRY)}")
+
+    model_name = plm_cfg.get("model_name")
+    if model_name is None:
+        model_name = list(BACKEND_REGISTRY[backend])[0]
+    if model_name not in BACKEND_REGISTRY[backend]:
+        raise ValueError(
+            f"Unknown model '{model_name}' for backend '{backend}'. "
+            f"Choose from {list(BACKEND_REGISTRY[backend])}"
+        )
+
+    expected_dim = BACKEND_REGISTRY[backend][model_name]
+    emb_suffix = "esm" if backend == "esm2" else backend
+    return backend, model_name, expected_dim, emb_suffix
+
+
+def _check_embedding_dim(loader, expected_dim: int, emb_path: Path):
+    dataset = loader.dataset
+    emb = getattr(dataset, "esm_embeddings", None)
+    if emb is None:
+        return
+    loaded_dim = int(emb.shape[-1])
+    if loaded_dim != expected_dim:
+        raise RuntimeError(
+            f"Embedding dimension mismatch for {emb_path}: loaded {loaded_dim}, "
+            f"expected {expected_dim}. Check config.plm.* and embedding file suffix."
+        )
 
 
 def encode_dataset(model, dataloader, device):
@@ -29,18 +72,21 @@ def encode_dataset(model, dataloader, device):
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Encoding dataset"):
-            one_hot = batch["one_hot"].to(device)
-            esm_emb = batch["esm_emb"].to(device)
+            target_indices = batch["target_indices"].to(device)
+            plm_emb = batch["esm_emb"].to(device)
             padding_mask = batch["padding_mask"].to(device)
             properties = batch["properties"].to(device)
             sequences = batch["sequence"]
 
-            if esm_emb.sum() != 0:
-                mu, logvar = model.encoder(one_hot, esm_emb, padding_mask)
+            # AA encoding via model's hybrid encoder
+            aa_features = model.aa_encoding(target_indices)
+
+            if plm_emb.sum() != 0:
+                mu, logvar = model.encoder(aa_features, plm_emb, padding_mask)
             else:
-                esm_emb_live = model.esm(sequences, max_len=one_hot.size(1))
-                esm_emb_live = esm_emb_live.to(device)
-                mu, logvar = model.encoder(one_hot, esm_emb_live, padding_mask)
+                plm_emb_live = model.plm(sequences, max_len=target_indices.size(1))
+                plm_emb_live = plm_emb_live.to(device)
+                mu, logvar = model.encoder(aa_features, plm_emb_live, padding_mask)
 
             # Use mu (not sampled z) for diffusion training
             all_z.append(mu.cpu())
@@ -110,8 +156,11 @@ def main():
         config = yaml.safe_load(f)
 
     device = torch.device(args.device)
+    backend, model_name, expected_plm_dim, emb_suffix = _resolve_plm_setup(config)
     print(f"=== Latent Diffusion Training ===")
     print(f"Device: {device}")
+    print(f"Config: {Path(args.config).resolve()}")
+    print(f"PLM backend: {backend} ({model_name})")
     vae_ckpt = args.vae_checkpoint
     if vae_ckpt is None:
         preferred = [
@@ -141,14 +190,34 @@ def main():
     print(f"Diffusion parameters: {diff_params:,}")
 
     # Encode training data
-    data_dir = PROJECT_ROOT / config["paths"]["data_dir"]
+    paths_cfg = config["paths"]
+    data_dir = PROJECT_ROOT / paths_cfg["data_dir"]
+    processed_dir = data_dir / paths_cfg.get("processed_dir", "processed")
+    embeddings_dir = data_dir / paths_cfg.get("embeddings_dir", "embeddings")
+    train_csv = processed_dir / "train.csv"
+    val_csv = processed_dir / "val.csv"
+    train_emb_path = embeddings_dir / f"train_{emb_suffix}.pt"
+    val_emb_path = embeddings_dir / f"val_{emb_suffix}.pt"
+    if not train_csv.exists():
+        raise FileNotFoundError(f"Missing training CSV: {train_csv}")
+    if not train_emb_path.exists():
+        raise FileNotFoundError(
+            f"Missing training embeddings for backend '{backend}': {train_emb_path}\n"
+            f"Run: python data/compute_embeddings.py --backend {backend} --model {model_name}"
+        )
+    print(f"Using CSV data directory: {processed_dir.resolve()}")
+    print(f"Dataset sizes: train={_count_csv_rows(train_csv)}"
+          + (f", val={_count_csv_rows(val_csv)}" if val_csv.exists() else ", val=missing"))
+    print(f"Using training embedding (dim={expected_plm_dim}): {train_emb_path.resolve()}")
     train_loader = create_dataloader(
-        data_dir / "processed" / "train.csv",
-        data_dir / "embeddings" / "train_esm.pt",
+        train_csv,
+        train_emb_path,
         max_len=config["vae"]["max_seq_len"],
         batch_size=config["train_diffusion"]["batch_size"],
         shuffle=False,
+        plm_embedding_dim=expected_plm_dim,
     )
+    _check_embedding_dim(train_loader, expected_plm_dim, train_emb_path)
 
     print("\nEncoding training data to latent space...")
     train_z, train_props = encode_dataset(model, train_loader, device)
@@ -169,9 +238,12 @@ def main():
         or config["train_diffusion"].get("validation", {}).get("enabled", False)
     )
     if val_enabled:
-        val_csv = data_dir / "processed" / "val.csv"
-        val_emb = data_dir / "embeddings" / "val_esm.pt"
+        val_emb = val_emb_path
         if val_csv.exists():
+            if not val_emb.exists():
+                raise FileNotFoundError(
+                    f"Validation CSV exists but embedding file is missing: {val_emb}"
+                )
             print("Encoding validation data to latent space...")
             val_data_loader = create_dataloader(
                 val_csv,
@@ -179,7 +251,9 @@ def main():
                 max_len=config["vae"]["max_seq_len"],
                 batch_size=config["train_diffusion"]["batch_size"],
                 shuffle=False,
+                plm_embedding_dim=expected_plm_dim,
             )
+            _check_embedding_dim(val_data_loader, expected_plm_dim, val_emb)
             val_z, val_props = encode_dataset(model, val_data_loader, device)
             val_dataset = LatentDataset(val_z, val_props)
             val_loader = torch.utils.data.DataLoader(

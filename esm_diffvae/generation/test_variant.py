@@ -1,52 +1,47 @@
-import torch
+"""Basic tests for variant generation utilities."""
 
 from generation.variant import (
-    enforce_edit_constraints,
-    sample_logits,
-    score_variant,
-    summarize_variants,
+    edit_distance,
+    highlight_mutations,
+    sequence_identity,
+    _as_int_choices,
+    _normalize_mode_weights,
+    _allocate_counts,
 )
 
 
-def test_sample_logits_shape_and_range():
-    torch.manual_seed(42)
-    logits = torch.randn(4, 7, 21)
-    sampled = sample_logits(logits, temperature=1.1, top_k=5, top_p=0.95)
-    assert sampled.shape == (4, 7)
-    assert int(sampled.min()) >= 0
-    assert int(sampled.max()) < 21
+def test_edit_distance():
+    assert edit_distance("ABC", "ABC") == 0
+    assert edit_distance("ABC", "ABD") == 1
+    assert edit_distance("ABC", "ABCD") == 1
+    assert edit_distance("", "ABC") == 3
 
 
-def test_score_variant_prefers_target_band():
-    ideal = score_variant(identity=0.75, edit_distance=5)
-    weak = score_variant(identity=0.30, edit_distance=15)
-    assert ideal > weak
+def test_sequence_identity():
+    assert sequence_identity("AAAA", "AAAA") == 1.0
+    assert sequence_identity("AAAA", "AABB") == 0.5
+    assert sequence_identity("AA", "AABB") == 0.5  # 2 matches / 4 max_len
 
 
-def test_summarize_variants_basic_stats():
-    variants = [
-        {"sequence": "AAAAK", "identity": 0.70, "edit_distance": 4},
-        {"sequence": "AAAAR", "identity": 0.80, "edit_distance": 5},
-        {"sequence": "AAAAR", "identity": 0.80, "edit_distance": 5},
-    ]
-    summary = summarize_variants(variants)
-    assert summary["count"] == 3
-    assert summary["unique_count"] == 2
-    assert 0 < summary["uniqueness_rate"] < 1
-    assert 0.7 <= summary["mean_identity"] <= 0.8
+def test_highlight_mutations():
+    assert highlight_mutations("ABC", "ABD") == "ABd"
+    assert highlight_mutations("ABC", "ABCDE") == "ABC|de"
 
 
-def test_enforce_edit_constraints_hits_target_band():
-    parent = torch.tensor([1, 2, 3, 4, 5])
-    sampled = torch.tensor([6, 7, 8, 9, 10])
-    logits = torch.randn(5, 21)
-    out = enforce_edit_constraints(
-        sampled_idx=sampled,
-        logits_row=logits,
-        parent_idx=parent,
-        min_edits=2,
-        max_edits=3,
-        pad_idx=20,
-    )
-    edits = int((out != parent).sum().item())
-    assert 2 <= edits <= 3
+def test_as_int_choices():
+    assert _as_int_choices([1, 5], []) == [1, 2, 3, 4, 5]
+    assert _as_int_choices([1, 2, 3], []) == [1, 2, 3]
+    assert _as_int_choices(3, []) == [3]
+
+
+def test_normalize_mode_weights():
+    w = _normalize_mode_weights(["a", "b"], {"a": 1.0, "b": 1.0})
+    assert abs(w["a"] - 0.5) < 1e-6
+    assert abs(w["b"] - 0.5) < 1e-6
+
+
+def test_allocate_counts():
+    counts = _allocate_counts(10, {"a": 0.7, "b": 0.3})
+    assert counts["a"] + counts["b"] == 10
+    assert counts["a"] == 7
+    assert counts["b"] == 3

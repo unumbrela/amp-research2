@@ -1,9 +1,9 @@
-"""VAE Encoder: maps sequence + ESM-2 embeddings to latent space.
+"""VAE Encoder: maps sequence encoding + PLM embeddings to latent space.
 
-v4: Bidirectional GRU replaces Transformer + CLS token.
+v6: Bidirectional GRU encoder.
+- Accepts any AA encoding (hybrid BLOSUM62+learned, or one-hot) + any PLM embeddings
 - Better suited for short peptides (~20 AA)
 - Naturally aggregates full sequence info via bidirectional hidden states
-- ~940K params (down from ~2.3M Transformer encoder)
 """
 
 import torch
@@ -13,15 +13,15 @@ import torch.nn as nn
 class AMPEncoder(nn.Module):
     """Bidirectional GRU VAE encoder.
 
-    Concatenates one-hot AA encoding with ESM-2 embeddings, projects to
-    hidden dim, runs through a bidirectional GRU, and maps the final
+    Concatenates AA encoding (BLOSUM62+learned or one-hot) with PLM embeddings,
+    projects to hidden dim, runs through a bidirectional GRU, and maps the final
     hidden states to latent distribution parameters (mu, logvar).
     """
 
     def __init__(
         self,
         esm_dim: int = 320,
-        aa_dim: int = 21,
+        aa_dim: int = 36,  # 20 (BLOSUM62) + 16 (learned) for hybrid; 21 for one-hot
         hidden_dim: int = 256,
         latent_dim: int = 64,
         n_layers: int = 1,
@@ -30,11 +30,24 @@ class AMPEncoder(nn.Module):
         super().__init__()
         input_dim = esm_dim + aa_dim  # 341
 
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-        )
+        # Gradual compression: input_dim → 512 → hidden_dim (avoid 4× bottleneck)
+        mid_dim = max(hidden_dim, min(512, input_dim))
+        if mid_dim > hidden_dim and input_dim > hidden_dim * 2:
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, mid_dim),
+                nn.LayerNorm(mid_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(mid_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+        else:
+            self.input_proj = nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
 
         self.gru = nn.GRU(
             input_size=hidden_dim,
@@ -51,22 +64,22 @@ class AMPEncoder(nn.Module):
 
     def forward(
         self,
-        one_hot: torch.Tensor,
-        esm_emb: torch.Tensor,
+        aa_features: torch.Tensor,
+        plm_emb: torch.Tensor,
         padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode to latent distribution parameters.
 
         Args:
-            one_hot: [B, L, 21] one-hot encoded sequence.
-            esm_emb: [B, L, esm_dim] ESM-2 per-residue embeddings.
+            aa_features: [B, L, aa_dim] AA encoding (BLOSUM62+learned or one-hot).
+            plm_emb: [B, L, esm_dim] PLM per-residue embeddings.
             padding_mask: [B, L] True for padded positions.
 
         Returns:
             mu: [B, latent_dim]
             logvar: [B, latent_dim]
         """
-        x = torch.cat([one_hot, esm_emb], dim=-1)  # [B, L, input_dim]
+        x = torch.cat([aa_features, plm_emb], dim=-1)  # [B, L, input_dim]
         x = self.input_proj(x)                       # [B, L, hidden_dim]
 
         # Pack padded sequences for efficient GRU processing

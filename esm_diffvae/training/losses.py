@@ -270,14 +270,20 @@ class ESMDiffVAELoss(nn.Module):
             self.kl_n_cycles, self.kl_ratio_ramp,
         )
 
-        # Supervised contrastive loss
-        amp_labels = properties[:, 0].long()  # binary AMP labels
-        l_contrastive = supervised_contrastive_loss(model_output["z"], amp_labels)
+        # Supervised contrastive loss (skip if lambda=0)
+        if self.lambda_contrastive > 0:
+            amp_labels = properties[:, 0].long()
+            l_contrastive = supervised_contrastive_loss(model_output["z"], amp_labels)
+        else:
+            l_contrastive = torch.tensor(0.0, device=l_recon.device)
 
-        # Property prediction loss
-        l_property = property_prediction_loss(
-            model_output["prop_preds"], properties, prop_mask
-        )
+        # Property prediction loss (skip if lambda=0)
+        if self.lambda_property > 0:
+            l_property = property_prediction_loss(
+                model_output["prop_preds"], properties, prop_mask
+            )
+        else:
+            l_property = torch.tensor(0.0, device=l_recon.device)
 
         # Length prediction loss
         l_length = length_prediction_loss(model_output["length_logits"], seq_lengths)

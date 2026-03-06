@@ -9,7 +9,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.esm_diffvae import ESMDiffVAE
-from training.dataset import indices_to_sequence, sequence_to_one_hot
+from training.dataset import indices_to_sequence, sequence_to_indices
 from training.utils import load_checkpoint
 from generation.variant import sequence_identity
 
@@ -80,11 +80,12 @@ def interpolate(
 
 def _encode_sequence(model: ESMDiffVAE, seq: str, device: torch.device) -> torch.Tensor:
     """Encode a single sequence to latent vector."""
-    one_hot = sequence_to_one_hot(seq, model.max_len).unsqueeze(0).to(device)
-    esm_emb = model.esm([seq], max_len=model.max_len).to(device)
+    target_indices = sequence_to_indices(seq, model.max_len).unsqueeze(0).to(device)
+    aa_features = model.aa_encoding(target_indices)
+    plm_emb = model.plm([seq], max_len=model.max_len).to(device)
     padding_mask = torch.zeros(1, model.max_len, dtype=torch.bool, device=device)
     padding_mask[:, len(seq):] = True
-    mu, _ = model.encoder(one_hot, esm_emb, padding_mask)
+    mu, _ = model.encoder(aa_features, plm_emb, padding_mask)
     return mu
 
 
